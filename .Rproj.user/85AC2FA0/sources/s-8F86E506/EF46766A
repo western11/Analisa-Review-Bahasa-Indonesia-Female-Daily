@@ -1,0 +1,27 @@
+{
+    "collab_server" : "",
+    "contents" : "",
+    "created" : 1588745363542.000,
+    "dirty" : false,
+    "encoding" : "UTF-8",
+    "folds" : "",
+    "hash" : "3833592958",
+    "id" : "EF46766A",
+    "lastKnownWriteTime" : 1589030602,
+    "last_content_update" : 1589032465968,
+    "path" : "E:/lab/Lydiu/lydiu/mk1.Rmd",
+    "project_path" : "mk1.Rmd",
+    "properties" : {
+        "cursorPosition" : "290,3",
+        "last_setup_crc32" : "",
+        "scrollLine" : "0",
+        "tempName" : "Untitled1"
+    },
+    "read_only" : false,
+    "read_only_alternatives" : [
+    ],
+    "relative_order" : 1,
+    "source_on_save" : false,
+    "source_window" : "",
+    "type" : "r_markdown"
+}

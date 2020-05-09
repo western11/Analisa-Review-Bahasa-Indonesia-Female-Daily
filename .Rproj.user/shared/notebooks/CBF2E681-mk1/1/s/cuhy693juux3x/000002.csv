@@ -1,0 +1,4 @@
+"0","# add custom bahasa stopwords"
+"0","bahasa.sw <- read.csv(""Bahasa.stopwords.csv"", header = F,fileEncoding = ""UTF-8-BOM"")"
+"0","bahasa.sw <- as.character(bahasa.sw$V1)"
+"0","bahasa.sw <- c(bahasa.sw, stopwords())"

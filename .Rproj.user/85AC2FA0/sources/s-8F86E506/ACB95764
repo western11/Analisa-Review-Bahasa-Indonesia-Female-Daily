@@ -1,0 +1,25 @@
+{
+    "collab_server" : "",
+    "contents" : "",
+    "created" : 1588748257075.000,
+    "dirty" : false,
+    "encoding" : "UTF-8",
+    "folds" : "",
+    "hash" : "0",
+    "id" : "ACB95764",
+    "lastKnownWriteTime" : 1585307900,
+    "last_content_update" : 1585307900,
+    "path" : "E:/ALGORITMA/With BD/BD stuff/wordcloud.Rmd",
+    "project_path" : null,
+    "properties" : {
+        "cursorPosition" : "51,8",
+        "scrollLine" : "0"
+    },
+    "read_only" : false,
+    "read_only_alternatives" : [
+    ],
+    "relative_order" : 4,
+    "source_on_save" : false,
+    "source_window" : "",
+    "type" : "r_markdown"
+}

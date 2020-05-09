@@ -1,0 +1,4 @@
+"0","set.seed(1502)"
+"0","splitter <- initial_split(new.dat, prop = 0.75, strata = ""labelY"")"
+"0","train <- training(splitter)"
+"0","test <- testing(splitter)"

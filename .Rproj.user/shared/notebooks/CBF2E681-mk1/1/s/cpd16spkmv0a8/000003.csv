@@ -1,0 +1,8 @@
+"0","# add custom stemming and slangword bahasa indonesia"
+"0","stemm_indo <- read.csv(""Stemming.csv"")"
+"0","oldstem <- as.character(stemm_indo$old)"
+"0","newstem <- as.character(stemm_indo$new)"
+"0",""
+"0","slang_indo <- read.csv(""Slangword.csv"")"
+"0","oldslang <- as.character(slang_indo$old)"
+"0","newslang <- as.character(slang_indo$new)"

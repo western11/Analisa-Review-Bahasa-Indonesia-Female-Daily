@@ -1,0 +1,8 @@
+"0","df.nb <- data.frame(t(as.matrix(cf.nb, what = ""overall"")))"
+"0","df.rf <- data.frame(t(as.matrix(cf.rf, what = ""overall"")))"
+"0",""
+"0","all.eval <- rbind(Naive_Bayes = df.nb, "
+"0","                  Random_Forest = df.rf) %>%"
+"0","  select(""Accuracy"") %>% data.frame()"
+"0",""
+"0","all.eval"

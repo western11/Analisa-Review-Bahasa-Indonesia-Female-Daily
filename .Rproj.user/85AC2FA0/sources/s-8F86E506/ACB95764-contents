@@ -1,0 +1,112 @@
+---
+title: "forBD"
+author: "jojoecp"
+date: "3/27/2020"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r}
+library(dplyr)
+library(tm)
+library(wordcloud)
+library(RColorBrewer)
+#library(stringr)
+library(tidytext)
+```
+
+```{r}
+data.1 <- read.csv("BD closed lost.csv")
+data.1 <- data.1 %>% mutate(
+  Company = as.character(Company),
+  Name = as.character(Name),
+  Explanation = as.character(Explanation)
+)
+
+# add custom bahasa stopwords
+bahasa.sw <- read.csv("Bahasa.stopwords.csv", header = F,fileEncoding = "UTF-8-BOM")
+bahasa.sw <- as.character(bahasa.sw$V1)
+bahasa.sw <- c(bahasa.sw, stopwords())
+```
+
+```{r}
+glimpse(data.1)
+```
+
+# Text cleaner
+## There's only few items to build the wordcloud (58 obs) so i think i don't need to findfreqterms
+## The words contain english and bahasa, i think i dont need to add `stemming`
+    But if we have a lots of words and we need to reduce the vocabulary and focus more on the sense or sentiment of our data, we will use `stemming` in tm function for english and also `katadasaR` for bahasa
+
+```{r}
+# convert to corpus first
+corp <- VCorpus(VectorSource(data.1$Explanation))
+# make function to make it easier for later use
+data_cleaner <- function(x){
+  cc <- tm_map(x, content_transformer(tolower))
+  cc <- tm_map(cc, removeNumbers)
+  cc <- tm_map(cc, removeWords, stopwords("en"))
+  cc <- tm_map(cc, removeWords, bahasa.sw)
+  cc <- tm_map(cc, removePunctuation)
+  cc <- tm_map(cc, stripWhitespace)
+}
+
+corp.clean <- data_cleaner(corp)
+```
+
+## Create DTM
+```{r}
+dtm <- TermDocumentMatrix(corp.clean)
+dtm.x <- as.matrix(dtm)
+dtm.x <- sort(rowSums(dtm.x), decreasing = T)
+dtm.x <- data.frame(word = names(dtm.x), freq=dtm.x, row.names = NULL)
+
+dtm.x
+```
+
+build the wordcloud
+```{r}
+set.seed(1502)
+wordcloud(words = dtm.x$word, freq = dtm.x$freq,
+          min.freq = 2, random.order = F, rot.per = 0.35,
+          colors = brewer.pal(8, "Spectral"))
+```
+
+You can also find the word-association if you want to find out what word(s) is related to certain word
+```{r}
+findAssocs(dtm, 
+           #Insert word here
+           terms = "lost",
+           #specify the corelation
+           corlimit = 0.1)
+```
+
+
+# If you dont satisfy with the result and wanted to know the wordlcoud (and frequency of words) without the text cleaner or whatsoever
+```{r}
+raw.text <- as.matrix(TermDocumentMatrix(VCorpus(VectorSource(data.1$Explanation))))
+raw.text <- sort(rowSums(raw.text), decreasing = T)
+raw.text <- data.frame(word = names(raw.text),
+                       freq = raw.text,
+                       row.names = NULL)
+raw.text
+```
+
+## raw wordcloud
+```{r}
+set.seed(1502)
+wordcloud(words = raw.text$word, freq = raw.text$freq,
+          random.order = F, rot.per = 0.35,
+          colors = brewer.pal(8, "Dark2"))
+```
+
+
+## coming soon: wordcloud group_by contact.type/source/owner/reason.category
+its actually just group_by %>% but we'll do it later
+```{r}
+
+```
+

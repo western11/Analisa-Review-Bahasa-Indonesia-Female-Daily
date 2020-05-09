@@ -1,0 +1,5 @@
+"0","review.dtm <- textcleaner(dat$review)
+"
+"2","Error in gsub(""\\w*[0-9]+\\w*\\s*"", """") : 
+  argument ""x"" is missing, with no default
+"

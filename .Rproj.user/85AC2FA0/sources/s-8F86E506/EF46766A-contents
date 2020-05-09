@@ -1,0 +1,294 @@
+---
+title: "mk1"
+author: "jojoecp"
+date: "5/6/2020"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r}
+library(dplyr)
+library(textclean)
+library(tm)
+library(SnowballC)
+library(stringr)
+library(e1071)
+library(tidymodels)
+library(caret)
+```
+
+```{r}
+# add custom bahasa stopwords
+bahasa.sw <- read.csv("Bahasa.stopwords.csv", header = F,fileEncoding = "UTF-8-BOM")
+bahasa.sw <- as.character(bahasa.sw$V1)
+bahasa.sw <- c(bahasa.sw, stopwords())
+```
+
+```{r}
+# add custom stemming and slangword bahasa indonesia
+stemm_indo <- read.csv("Stemming.csv")
+oldstem <- as.character(stemm_indo$old)
+newstem <- as.character(stemm_indo$new)
+
+slang_indo <- read.csv("Slangword.csv")
+oldslang <- as.character(slang_indo$old)
+newslang <- as.character(slang_indo$new)
+```
+
+```{r}
+# import data
+dat <- read.csv("emina1.csv")
+dat <- dat %>% rename(
+  "review" = "ï..review"
+) %>% select(review,rating) %>%
+  na.omit()
+
+dat$rating <- as.factor(dat$rating)
+
+table(dat$rating)
+```
+
+```{r}
+head(dat$review)
+```
+
+
+```{r}
+
+stemmword <- function(x) Reduce(function(x,r) gsub(stemm_indo$old[r],stemm_indo$new[r],x,fixed=T),
+seq_len(nrow(stemm_indo)),x)
+
+slangword <- function(x) Reduce(function(x,r) gsub(slang_indo$old[r],slang_indo$new[r],x,fixed=T),
+seq_len(nrow(slang_indo)),x)
+
+textcleaner <- function(x){
+  x <- as.character(x)
+  
+  x <- x %>%
+    str_to_lower() %>%  # convert all the string to low alphabet
+    replace_contraction() %>% # replace contraction to their multi-word forms
+    replace_internet_slang() %>% # replace internet slang to normal words
+    replace_emoji() %>%
+    replace_emoticon() %>%
+    replace_hash(replacement = "") %>%
+    replace_word_elongation() %>% # replace informal writing with known semantic replacements
+    replace_number(remove = T) %>% # remove number
+    replace_date(replacement = "") %>% # remove date
+    replace_time(replacement = "") %>%
+    str_remove_all(pattern = "[[:punct:]]") %>% # remove punctuation
+    str_remove_all(pattern = "[^\\s]*[0-9][^\\s]*") %>%
+    str_squish() %>% # reduces repeated whitespace inside a string.
+    str_trim() # removes whitespace from start and end of string
+  
+  xdtm <- VCorpus(VectorSource(x)) %>%
+    tm_map(removeWords, stopwords("en")) %>%
+    tm_map(removeWords, bahasa.sw) %>%
+    tm_map(removePunctuation) %>%
+    tm_map(content_transformer(stemmword)) %>%
+    tm_map(content_transformer(slangword))
+  
+  
+  return(DocumentTermMatrix(xdtm))
+    
+}
+
+```
+
+
+```{r}
+review.dtm <- textcleaner(dat$review)
+
+freqterm <- findFreqTerms(review.dtm, 15)
+dat_dtm <- review.dtm[,freqterm]
+```
+
+```{r}
+dat.clean <- as.data.frame(as.matrix(dat_dtm), stringsAsFactors = F)
+# we have 800+ variable in words form. i change the label name from `mood` to labelY to avoid overwriting column names
+new.dat <- cbind(dat.clean, data.frame(labelY = dat$rating))
+head(new.dat)
+```
+
+# Modeling
+## splitting
+```{r}
+set.seed(1502)
+splitter <- initial_split(new.dat, prop = 0.75, strata = "labelY")
+train <- training(splitter)
+test <- testing(splitter)
+```
+
+## Naive Bayes
+```{r}
+# split the data. 75% for train data, and 25% for test data
+set.seed(1502)
+index <- sample(1:nrow(dat_dtm), 0.75*nrow(dat_dtm))
+
+train_x <- dat_dtm[index,]
+test_x <- dat_dtm[-index,]
+# subset label/target variable
+train_label <- dat[index,"rating"]
+test_label <- dat[-index,"rating"]
+```
+
+Use bernoulli converter to convert any value above 0 to 1 and 0 to remain 0.
+```{r}
+# bernoulli conv 
+bernoulli_conv <- function(x){
+  x <- as.factor(as.numeric(x>0))
+}
+```
+
+apply bernoulli converter to train and test data
+```{r}
+train_x <- apply(train_x,2,bernoulli_conv)
+test_x <- apply(test_x,2,bernoulli_conv)
+```
+
+```{r}
+# train the model
+mod.nb <- naiveBayes(train_x, as.factor(train_label), laplace = 1)
+# predict to test data
+pred.nb <- predict(mod.nb, test_x,
+                   type = "class")
+
+pred.nb.x <- cbind(data.frame(pred.nb),as.factor(test_label))%>%
+  setNames(c("pred","actual"))
+```
+
+create confusion matrix for later evaluation
+```{r}
+cf.nb <- confusionMatrix(data = pred.nb.x$pred,
+                         reference = pred.nb.x$actual)
+cf.nb
+```
+
+## Random Forest
+```{r}
+# this chunks are made for random forest model and future model tuning
+## the column names like break,for,next,if are considered as special character thus raises an error when building random forest and model tuning.
+## i store the train and test data to new variabel so the old one remain reproducible
+train_tune <- train
+test_tune <- test
+
+colnames(train_tune) <- make.names(colnames(train_tune))
+colnames(test_tune) <- make.names(colnames(test_tune))
+
+# build 5 folds cross validation for tuning evaluation
+set.seed(1502)
+folds <- vfold_cv(train_tune, 5)
+```
+
+```{r}
+mod.rf <- rand_forest(trees = 550, mtry = 6, mode = "classification") %>%
+  set_engine("ranger") %>% fit(labelY~., data = train_tune)
+
+pred.rf <- predict(mod.rf, test_tune, 
+                   type = "class")
+
+pred.rf.x <- as.data.frame(cbind(pred.rf, test_tune$labelY)) %>%
+  setNames(c("pred","actual"))
+
+pred.rf.x
+```
+create confusion matrix for later use
+```{r}
+cf.rf <- confusionMatrix(data = pred.rf.x$pred,
+                         reference = pred.rf.x$actual)
+cf.rf
+```
+
+
+
+```{r}
+hist(as.integer(dat$rating))
+hist(as.integer(pred.nb.x$pred))
+table(dat$rating)
+table(as.integer(pred.nb.x$pred))
+```
+
+
+# Topic Modeling
+
+```{r}
+library(topicmodels)
+library(tidytext)
+library(ggplot2)
+```
+
+subset data by their rating
+```{r}
+dat_5 <- dat %>% filter(rating == 5)
+dat_4 <- dat %>% filter(rating == 4)
+dat_3 <- dat %>% filter(rating == 3)
+dat_2 <- dat %>% filter(rating == 2)
+dat_1 <- dat %>% filter(rating == 1)
+```
+
+## Topic modeling rating 5
+```{r}
+dat_5_dtm <- textcleaner(dat_5$review)
+freqterm_5 <- findFreqTerms(dat_5_dtm, 5)
+dat_5_dtm <- dat_5_dtm[,freqterm_5]
+row_num5 <- apply(dat_5_dtm,1,sum)
+dat_5_dtm <- dat_5_dtm[row_num5>0,]
+
+lda_5 <- LDA(dat_5_dtm, k = 5, control = list(seed=1502))
+```
+
+```{r}
+topic_5 <- tidy(lda_5,matrix="beta")
+```
+```{r}
+top_terms_5 <- topic_5 %>%
+  group_by(topic) %>%
+  top_n(10, beta) %>%
+  ungroup() %>%
+  arrange(topic, -beta)
+
+top_terms_5 %>%
+  mutate(term = reorder_within(term, beta, topic)) %>%
+  ggplot(aes(term, beta, fill = factor(topic))) +
+  geom_col(show.legend = FALSE) +
+  facet_wrap(~ topic, scales = "free") +
+  coord_flip() +
+  scale_x_reordered()
+```
+
+
+## Topic modeling rating 1
+```{r}
+dat_1_dtm <- textcleaner(dat_1$review)
+freqterm_1 <- findFreqTerms(dat_1_dtm, 3)
+dat_1_dtm <- dat_1_dtm[,freqterm_1]
+row_num1 <- apply(dat_1_dtm,1,sum)
+dat_1_dtm <- dat_1_dtm[row_num1>0,]
+
+lda_1 <- LDA(dat_1_dtm, k = 5, control = list(seed=1502))
+```
+
+```{r}
+topic_1 <- tidy(lda_1,matrix="beta")
+```
+
+```{r}
+top_terms_1 <- topic_1 %>%
+  group_by(topic) %>%
+  top_n(10, beta) %>%
+  ungroup() %>%
+  arrange(topic, -beta)
+
+top_terms_1 %>%
+  mutate(term = reorder_within(term, beta, topic)) %>%
+  ggplot(aes(term, beta, fill = factor(topic))) +
+  geom_col(show.legend = FALSE) +
+  facet_wrap(~ topic, scales = "free") +
+  coord_flip() +
+  scale_x_reordered()
+```
+
+
+

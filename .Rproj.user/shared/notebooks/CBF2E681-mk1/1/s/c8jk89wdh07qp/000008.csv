@@ -1,0 +1,5 @@
+"0","lda_5 <- LDA(dat_5_dtm, k = 5, control = list(seed=1502))
+"
+"2","Error in LDA(dat_5_dtm, k = 5, control = list(seed = 1502)) : 
+  Each row of the input matrix needs to contain at least one non-zero entry
+"
