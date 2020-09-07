@@ -1,0 +1,931 @@
+---
+title: "Analisa review pengguna produk kecantikan Biore"
+author: "Lydia Catur Wulandari"
+date: "6/20/2020"
+output:
+  html_document:
+   toc: true
+   toc_float: true
+   toc_depth: 2
+   theme: flatly
+   highlight: zenburn
+   df_print: paged
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, 
+                      fig.align = "center")
+
+options(scipen = 999)
+```
+
+# Background {.tabset}
+## Objective
+Projek ini bertujuan untuk:   
+- Mencari topik yang dibicarakan user FemaleDaily.com pada setiap rating (topic modeling)   
+- Bagaimana Sentiment yang diberikan user dapat memprediksi rating   
+- Membangun model dengan akurasi terbaik dalam memprediksi rating produk
+
+Data bersumber dari FemaleDaily.com dengan 3 produk yang berbeda. Data berisi review (teks) dan rating pengguna berbahasa Indonesia. Data akan diolah terpisah untuk menjawab pertanyaan penelitian/objective dari projek
+
+## Library
+Berikut library yang digunakan. jika library tidak tersedia lakukan
+
+
+```{r}
+#install.packages("dplyr")
+```
+
+```{r warning=FALSE, message=FALSE}
+# Data wrangling
+library(plyr)
+library(dplyr)
+# Text manipulation and cleaning
+library(textclean)
+library(tm)
+library(SnowballC)
+library(stringr)
+library(stringi)
+# Topic models
+library(topicmodels)
+library(tidytext)
+# Visualization
+library(ggplot2)
+library(scales)
+# Association rules
+library(arules)
+# Modeling and classification
+library(e1071)
+library(parsnip)
+library(yardstick)
+library(caret)
+library(rsample)
+```
+
+# Data import
+```{r}
+biore <- read.csv("biore1.csv")
+biore <- setNames(biore,c("review","rating")) %>%
+  na.omit()
+biore$rating <- as.factor(biore$rating)
+table(biore$rating)
+```
+
+import stopwords bahasa Indonesia
+```{r}
+# add custom bahasa stopwords
+bahasa.sw <- read.csv("Bahasa.stopwords.csv", header = F,fileEncoding = "UTF-8-BOM")
+bahasa.sw <- as.character(bahasa.sw$V1)
+bahasa.sw <- c(bahasa.sw, stopwords())
+```
+
+Import stemming dan slangword converter bahasa Indonesia
+```{r}
+# add custom stemming and slangword bahasa indonesia
+stemm_indo <- read.csv("Stemming 2.csv",sep = ";")
+oldstem <- as.character(stemm_indo$old)
+newstem <- as.character(stemm_indo$new)
+
+slang_indo <- read.csv("Slangword2.csv",sep = ";")
+oldslang <- as.character(slang_indo$old)
+newslang <- as.character(slang_indo$new)
+```
+
+# Text Cleaning
+Teks perlu dibersihkan sebelum dilakukan topic modeling dan prediksi. Tahap pembersihan yang dilakukan adalah:    
+- Mengubah seluruh teks menjadi huruf kecil (lower)   
+- Mengubah contraction (contoh: i've -> i have, you're -> you are)   
+- mengubah slang words (contoh: gw -> aku, bgt -> banget, bagussss -> bagus)   
+- menghapus emoji, emoticon, hash, angka, date, time, dan punctuation (/ , . " ;)   
+- menghapus spasi berlebih antar kata (whitespace)   
+- menghapus imbuhan (contoh: membeli -> beli, harganya -> harga)   
+Setelah dibersihkan, data lalu dirubah ke bentuk corpus dan melakukan tokenization (perhitungan jumlah per kata dalam tiap review). Proses pembersihan sampai pembentukan corpus dibuat kedalam function `textcleaner` agar function bisa digunakan untuk tahapan selanjutnya. 
+
+## membuat `textcleaner` function
+```{r}
+# membuat function untuk stemming bahasa Indonesia
+stemmword <- function(x) Reduce(function(x,r) gsub(stemm_indo$old[r],stemm_indo$new[r],x,fixed=T),
+seq_len(nrow(stemm_indo)),x)
+
+# membuat function untuk konversi slangword bahasa Indonesia
+slangword <- function(x) Reduce(function(x,r) gsub(slang_indo$old[r],slang_indo$new[r],x,fixed=T),
+seq_len(nrow(slang_indo)),x)
+
+# membuat function textcleaner
+textcleaner <- function(x){
+  x <- as.character(x)
+  
+  x <- x %>%
+    str_to_lower() %>%  # convert all the string to low alphabet
+    replace_contraction() %>% # replace contraction to their multi-word forms
+    replace_internet_slang() %>% # replace internet slang to normal words
+    replace_emoji() %>% # replace emoji to words
+    replace_emoticon() %>% # replace emoticon to words
+    replace_hash(replacement = "") %>% # remove hashtag
+    replace_word_elongation() %>% # replace informal writing with known semantic replacements
+    replace_number(remove = T) %>% # remove number
+    replace_date(replacement = "") %>% # remove date
+    replace_time(replacement = "") %>% # remove time
+    str_remove_all(pattern = "[[:punct:]]") %>% # remove punctuation
+    str_remove_all(pattern = "[^\\s]*[0-9][^\\s]*") %>% # remove mixed string n number
+    str_squish() %>% # reduces repeated whitespace inside a string.
+    str_trim() # removes whitespace from start and end of string
+  
+  xdtm <- VCorpus(VectorSource(x)) %>%
+    tm_map(removeWords, stopwords("en")) %>%
+    tm_map(removeWords, bahasa.sw) %>%
+    tm_map(removePunctuation) %>%
+    tm_map(content_transformer(stemmword)) %>%
+    tm_map(content_transformer(slangword))
+  
+  # mengubah corpus menjadi document term matrix
+  return(DocumentTermMatrix(xdtm))
+    
+}
+
+```
+
+# Topic Modeling
+Topic modeling dilakukan untuk menjawab pertanyaan penelitian nomor 1, yaitu **Apa topik yang dibicarakan user FemaleDaily.com pada setiap rating?** Algoritma yang digunakan untuk mencari topic modeling adalah *Latent Dirichlet Allocation (LDA)*. LDA adalah model matematika yang digunakan untuk menemukan campuran kata yang terkait dengan setiap topik, juga menentukan campuran topik yang menggambarkan setiap dokumen. LDA bekerja untuk menjawab 2 prinsip topic modeling berikut:   
+
+- Every document is a mixture of topics   
+- Every topic is a mixture of words   
+
+Memisahkan review berdasarkan rating
+```{r}
+biore_1 <- biore %>% filter(rating == 1)
+biore_2 <- biore %>% filter(rating == 2)
+biore_3 <- biore %>% filter(rating == 3)
+biore_4 <- biore %>% filter(rating == 4)
+biore_5 <- biore %>% filter(rating == 5)
+```
+
+
+## Topic modeling rating 5
+Sebelum melakukan topic modeling, perlu dilakukan pembersihan teks sama seperti modeling prediksi di tahap sebelumnya. Di modeling prediksi pembersihan dilakukan seara menyeluruh tanpa melihat rating. Disini dilakukan pembersihan ulang dengan data yang sudah di subset. Pengerjan topic modeling akan dibuat 5x sesuai banyak rating
+
+Proses pembersihan teks
+```{r}
+# mengaplikasikan function textcleaner pada review dengan rating 5
+bio_5_dtm <- textcleaner(biore_5$review)
+# Filter kata yang ada di lebih dari 5 review
+freqbio_5 <- findFreqTerms(bio_5_dtm, 10)
+bio_5_dtm <- bio_5_dtm[,freqbio_5]
+# setelah filtering akan ada data sisa tanpa isi token. data sperti itu akan dihilangkan
+row_bio5 <- apply(bio_5_dtm,1,sum)
+bio_5_dtm <- bio_5_dtm[row_bio5>0,]
+```
+
+mengaplikasikan algoritma LDA untuk mencari topic modeling. Disini akan dibuat 2 topik pembicaraan pada setiap rating
+```{r}
+lda_5_bio <- LDA(bio_5_dtm, k = 2, control = list(seed=1502))
+topic_5_bio <- tidy(lda_5_bio,matrix="beta")
+```
+
+Membuat visualisasi topik yang dibicarakan
+```{r}
+top_bio_5 <- topic_5_bio %>%
+  group_by(topic) %>%
+  top_n(15, beta) %>%
+  ungroup() %>%
+  arrange(topic, -beta)
+
+bio_topic_5 <- top_bio_5 %>%
+  mutate(term = reorder_within(term, beta, topic)) %>%
+  ggplot(aes(term, beta, fill = factor(topic))) +
+  geom_col(show.legend = FALSE) +
+  facet_wrap(~ topic, scales = "free") +
+  coord_flip() +
+  scale_x_reordered() +
+  labs(title = "Topik pembicaraan pada review di rating 5 FemaleDaily",
+       subtitle = "Produk sunscreen Biore")
+
+bio_topic_5
+```
+
+mengambil average dari beta tiap kata yang muncul dalam topic modeling, lalu mengambil average beta tertinggi. kata yang tersimpan nanti akan digabungkan dengan kata topic modeling semua rating sebagai prediktor pada tahap prediksi
+```{r}
+word_5_bio <- topic_5_bio %>% group_by(term) %>%
+  dplyr::summarise(mean_beta = mean(beta)) %>%
+  arrange(-mean_beta) %>% select("term") %>% slice(1:250)
+
+word_5_bio
+```
+
+## Topic modeling rating 4
+
+Proses pembersihan teks
+```{r}
+# mengaplikasikan function textcleaner pada review dengan rating 4
+bio_4_dtm <- textcleaner(biore_4$review)
+# Filter kata yang ada di lebih dari 5 review
+freqbio_4 <- findFreqTerms(bio_4_dtm, 5)
+bio_4_dtm <- bio_4_dtm[,freqbio_4]
+# setelah filtering akan ada data sisa tanpa isi token. data sperti itu akan dihilangkan
+row_bio4 <- apply(bio_4_dtm,1,sum)
+bio_4_dtm <- bio_4_dtm[row_bio4>0,]
+```
+
+mengaplikasikan algoritma LDA untuk mencari topic modeling. Disini akan dibuat 5 topik pembicaraan pada setiap rating
+```{r}
+lda_4_bio <- LDA(bio_4_dtm, k = 2, control = list(seed=1502))
+topic_4_bio <- tidy(lda_4_bio,matrix="beta")
+```
+
+Membuat visualisasi topik yang dibicarakan
+```{r}
+top_bio_4 <- topic_4_bio %>%
+  group_by(topic) %>%
+  top_n(15, beta) %>%
+  ungroup() %>%
+  arrange(topic, -beta)
+
+bio_topic_4 <- top_bio_4 %>%
+  mutate(term = reorder_within(term, beta, topic)) %>%
+  ggplot(aes(term, beta, fill = factor(topic))) +
+  geom_col(show.legend = FALSE) +
+  facet_wrap(~ topic, scales = "free") +
+  coord_flip() +
+  scale_x_reordered() +
+  labs(title = "Topik pembicaraan pada review di rating 4 FemaleDaily",
+       subtitle = "Produk sunscreen Biore")
+
+bio_topic_4
+```
+
+```{r}
+word_4_bio <- topic_4_bio %>% group_by(term) %>%
+  dplyr::summarise(mean_beta = mean(beta)) %>%
+  arrange(-mean_beta) %>% select("term") %>% slice(1:250)
+
+word_4_bio
+```
+
+## Topic modeling rating 3
+Proses pembersihan teks
+```{r}
+# mengaplikasikan function textcleaner pada review dengan rating 3
+bio_3_dtm <- textcleaner(biore_3$review)
+# Filter kata yang ada di lebih dari 4 review
+freqbio_3 <- findFreqTerms(bio_3_dtm, 4)
+bio_3_dtm <- bio_3_dtm[,freqbio_3]
+# setelah filtering akan ada data sisa tanpa isi token. data sperti itu akan dihilangkan
+row_bio3 <- apply(bio_3_dtm,1,sum)
+bio_3_dtm <- bio_3_dtm[row_bio3>0,]
+```
+
+mengaplikasikan algoritma LDA untuk mencari topic modeling. Disini akan dibuat 5 topik pembicaraan pada setiap rating
+```{r}
+lda_3_bio <- LDA(bio_3_dtm, k = 2, control = list(seed=1502))
+topic_3_bio <- tidy(lda_3_bio,matrix="beta")
+```
+
+Membuat visualisasi topik yang dibicarakan
+```{r}
+bio_terms_3 <- topic_3_bio %>%
+  group_by(topic) %>%
+  top_n(15, beta) %>%
+  ungroup() %>%
+  arrange(topic, -beta)
+
+bio_topic_3 <- bio_terms_3 %>%
+  mutate(term = reorder_within(term, beta, topic)) %>%
+  ggplot(aes(term, beta, fill = factor(topic))) +
+  geom_col(show.legend = FALSE) +
+  facet_wrap(~ topic, scales = "free") +
+  coord_flip() +
+  scale_x_reordered() +
+  labs(title = "Topik pembicaraan pada review di rating 3 FemaleDaily",
+       subtitle = "Produk sunscreen Biore")
+
+bio_topic_3
+```
+
+```{r}
+word_3_bio <- topic_3_bio %>% group_by(term) %>%
+  dplyr::summarise(mean_beta = mean(beta)) %>%
+  arrange(-mean_beta) %>% select("term") %>% slice(1:250)
+
+word_3_bio
+```
+
+## Topic modeling rating 2
+Proses pembersihan teks
+```{r}
+# mengaplikasikan function textcleaner pada review dengan rating 2
+bio_2_dtm <- textcleaner(biore_2$review)
+# Filter kata yang ada di lebih dari 5 review
+freqbio_2 <- findFreqTerms(bio_2_dtm, 3)
+bio_2_dtm <- bio_2_dtm[,freqbio_2]
+# setelah filtering akan ada data sisa tanpa isi token. data sperti itu akan dihilangkan
+row_bio2 <- apply(bio_2_dtm,1,sum)
+bio_2_dtm <- bio_2_dtm[row_bio2>0,]
+```
+
+mengaplikasikan algoritma LDA untuk mencari topic modeling. Disini akan dibuat 5 topik pembicaraan pada setiap rating
+```{r}
+lda_2_bio <- LDA(bio_2_dtm, k = 2, control = list(seed=1502))
+topic_2_bio <- tidy(lda_2_bio,matrix="beta")
+```
+
+Membuat visualisasi topik yang dibicarakan
+```{r}
+bio_terms_2 <- topic_2_bio %>%
+  group_by(topic) %>%
+  top_n(15, beta) %>%
+  ungroup() %>%
+  arrange(topic, -beta)
+
+bio_topic_2 <- bio_terms_2 %>%
+  mutate(term = reorder_within(term, beta, topic)) %>%
+  ggplot(aes(term, beta, fill = factor(topic))) +
+  geom_col(show.legend = FALSE) +
+  facet_wrap(~ topic, scales = "free") +
+  coord_flip() +
+  scale_x_reordered() +
+  labs(title = "Topik pembicaraan pada review di rating 2 FemaleDaily",
+       subtitle = "Produk sunscreen Biore")
+
+bio_topic_2
+```
+
+
+```{r}
+word_2_bio <- topic_2_bio %>% group_by(term) %>%
+  dplyr::summarise(mean_beta = mean(beta)) %>%
+  arrange(-mean_beta) %>% select("term") %>% slice(1:200)
+
+word_2_bio
+```
+
+## Topic modeling rating 1
+
+Proses pembersihan teks
+```{r}
+# mengaplikasikan function textcleaner pada review dengan rating 1
+bio_1_dtm <- textcleaner(biore_1$review)
+# Filter kata yang ada di lebih dari 1 review
+freqbio_1 <- findFreqTerms(bio_1_dtm, 2)
+bio_1_dtm <- bio_1_dtm[,freqbio_1]
+# setelah filtering akan ada data sisa tanpa isi token. data sperti itu akan dihilangkan
+row_bio1 <- apply(bio_1_dtm,1,sum)
+bio_1_dtm <- bio_1_dtm[row_bio1>0,]
+```
+
+mengaplikasikan algoritma LDA untuk mencari topic modeling. Disini akan dibuat 5 topik pembicaraan pada setiap rating
+```{r}
+lda_1_bio <- LDA(bio_1_dtm, k = 2, control = list(seed=1502))
+topic_1_bio <- tidy(lda_1_bio,matrix="beta")
+```
+
+
+Membuat visualisasi topik yang dibicarakan
+```{r}
+bio_terms_1 <- topic_1_bio %>%
+  group_by(topic) %>%
+  top_n(15, beta) %>%
+  ungroup() %>%
+  arrange(topic, -beta)
+
+bio_topic_1 <- top_terms_1 %>%
+  mutate(term = reorder_within(term, beta, topic)) %>%
+  ggplot(aes(term, beta, fill = factor(topic))) +
+  geom_col(show.legend = FALSE) +
+  facet_wrap(~ topic, scales = "free") +
+  coord_flip() +
+  scale_x_reordered() +
+  labs(title = "Topik pembicaraan pada review di rating 1 FemaleDaily",
+       subtitle = "Produk sunscreen Biore")
+
+bio_topic_1
+```
+
+```{r}
+word_1_bio <- topic_1_bio %>% group_by(term) %>%
+  dplyr::summarise(mean_beta = mean(beta)) %>%
+  arrange(-mean_beta) %>% select("term") %>% slice(1:200)
+
+word_1_bio
+```
+
+## membuat password
+menggabungkan semua highest beta average word dari ke-5 rating
+```{r}
+password_biore <- rbind(word_1_bio,word_2_bio,word_3_bio,word_4_bio,word_5_bio)
+# remove duplicate rows
+password_biore <- password_biore[!duplicated(password_biore),]
+```
+
+# Text Association Rules based on topic modeling
+
+text cleaner tanpa dtm dan stopword
+```{r}
+# membuat function textcleaner
+textcleaner_asc <- function(x){
+  x <- as.character(x)
+  
+  x <- x %>%
+    str_to_lower() %>%  # convert all the string to low alphabet
+    replace_contraction() %>% # replace contraction to their multi-word forms
+    replace_internet_slang() %>% # replace internet slang to normal words
+    replace_emoji() %>% # replace emoji to words
+    replace_emoticon() %>% # replace emoticon to words
+    replace_hash(replacement = "") %>% # remove hashtag
+    replace_word_elongation() %>% # replace informal writing with known semantic replacements
+    replace_number(remove = T) %>% # remove number
+    replace_date(replacement = "") %>% # remove date
+    replace_time(replacement = "") %>% # remove time
+    str_remove_all(pattern = "[[:punct:]]") %>% # remove punctuation
+    str_remove_all(pattern = "[^\\s]*[0-9][^\\s]*") %>% # remove mixed string n number
+    str_squish() %>% # reduces repeated whitespace inside a string.
+    str_trim() # removes whitespace from start and end of string
+  
+  return(as.data.frame(x))
+    
+}
+
+```
+
+## word rules rating 5
+
+```{r}
+# clean text
+asc_5_bio <- textcleaner_asc(biore_5$review)
+asc_5_bio$id <- rownames(asc_5_bio)
+# simpan word dari topic modeling yang akan digunakan untuk membuat rules
+keepword_5_bio <- as.character(unique(topic_5_bio$term))
+
+# filter teks tiap review hanya mengambil word yang ada di keepword
+asc_5_token_bio <- unnest_tokens(asc_5_bio,word,x)
+asc_5_token_bio <- filter(asc_5_token_bio, word %in% keepword_5_bio)
+asc_5_clean_bio <- asc_5_token_bio %>% group_by(id) %>%
+  summarize(word = str_c(word,collapse = " "))
+```
+
+```{r}
+# mengubah tiap word yang sudah bersih menjadi kolom
+split_clean5_bio <- stri_split_fixed(asc_5_clean_bio$word," ",simplify = T)
+split_clean5_bio <- as.data.frame(split_clean5_bio)
+# simpan teks dengan kolom
+write.csv(split_clean5_bio,"split_bio5.csv",row.names = F)
+```
+
+```{r}
+# read data teks sebagai data transaction untuk dibuatkan model association rules
+trans_5_bio <- read.transactions("split_bio5.csv",sep = ",",header = T)
+# modeling association rules menggunakan algoritma apriori
+rules_5_bio <- apriori(trans_5_bio,parameter = list(supp = 0.1, conf = 0.5))
+# ubah hasil association rules menjadi dataframe
+bio_rules_5 <- data.frame(arules::inspect(rules_5_bio))
+# simpan hasil association rules
+write.csv(bio_rules_5,"rules5_biore.csv",row.names = F)
+
+```
+
+## word rules rating 4
+
+```{r}
+# clean text
+asc_4_bio <- textcleaner_asc(biore_4$review)
+asc_4_bio$id <- rownames(asc_4_bio)
+# simpan word dari topic modeling yang akan digunakan untuk membuat rules
+keepword_4_bio <- as.character(unique(topic_4_bio$term))
+
+# filter teks tiap review hanya mengambil word yang ada di keepword
+asc_4_token_bio <- unnest_tokens(asc_4_bio,word,x)
+asc_4_token_bio <- filter(asc_4_token_bio, word %in% keepword_4_bio)
+asc_4_clean_bio <- asc_4_token_bio %>% group_by(id) %>%
+  summarize(word = str_c(word,collapse = " "))
+```
+
+```{r}
+# mengubah tiap word yang sudah bersih menjadi kolom
+split_clean4_bio <- stri_split_fixed(asc_4_clean_bio$word," ",simplify = T)
+split_clean4_bio <- as.data.frame(split_clean4_bio)
+# simpan teks dengan kolom
+write.csv(split_clean4_bio,"split_bio4.csv",row.names = F)
+```
+
+```{r}
+# read data teks sebagai data transaction untuk dibuatkan model association rules
+trans_4_bio <- read.transactions("split_bio4.csv",sep = ",",header = T)
+# modeling association rules menggunakan algoritma apriori
+rules_4_bio <- apriori(trans_4_bio,parameter = list(supp = 0.1, conf = 0.5))
+# ubah hasil association rules menjadi dataframe
+bio_rules_4 <- data.frame(arules::inspect(rules_4_bio))
+# simpan hasil association rules
+write.csv(bio_rules_4,"rules4_biore.csv",row.names = F)
+
+```
+
+## word rules rating 3
+
+```{r}
+# clean text
+asc_3_bio <- textcleaner_asc(biore_3$review)
+asc_3_bio$id <- rownames(asc_3_bio)
+# simpan word dari topic modeling yang akan digunakan untuk membuat rules
+keepword_3_bio <- as.character(unique(topic_3_bio$term))
+
+# filter teks tiap review hanya mengambil word yang ada di keepword
+asc_3_token_bio <- unnest_tokens(asc_3_bio,word,x)
+asc_3_token_bio <- filter(asc_3_token_bio, word %in% keepword_3_bio)
+asc_3_clean_bio <- asc_3_token_bio %>% group_by(id) %>%
+  summarize(word = str_c(word,collapse = " "))
+```
+
+```{r}
+# mengubah tiap word yang sudah bersih menjadi kolom
+split_clean3_bio <- stri_split_fixed(asc_3_clean_bio$word," ",simplify = T)
+split_clean3_bio <- as.data.frame(split_clean3_bio)
+# simpan teks dengan kolom
+write.csv(split_clean3_bio,"split_bio3.csv",row.names = F)
+```
+
+```{r}
+# read data teks sebagai data transaction untuk dibuatkan model association rules
+trans_3_bio <- read.transactions("split_bio3.csv",sep = ",",header = T)
+# modeling association rules menggunakan algoritma apriori
+rules_3_bio <- apriori(trans_3_bio,parameter = list(supp = 0.1, conf = 0.5))
+# ubah hasil association rules menjadi dataframe
+bio_rules_3 <- data.frame(arules::inspect(rules_3_bio))
+# simpan hasil association rules
+write.csv(bio_rules_3,"rules3_biore.csv",row.names = F)
+
+```
+
+## word rules rating 2
+
+```{r}
+# clean text
+asc_2_bio <- textcleaner_asc(biore_2$review)
+asc_2_bio$id <- rownames(asc_2_bio)
+# simpan word dari topic modeling yang akan digunakan untuk membuat rules
+keepword_2_bio <- as.character(unique(topic_2_bio$term))
+
+# filter teks tiap review hanya mengambil word yang ada di keepword
+asc_2_token_bio <- unnest_tokens(asc_2_bio,word,x)
+asc_2_token_bio <- filter(asc_2_token_bio, word %in% keepword_2_bio)
+asc_2_clean_bio <- asc_2_token_bio %>% group_by(id) %>%
+  summarize(word = str_c(word,collapse = " "))
+```
+
+```{r}
+# mengubah tiap word yang sudah bersih menjadi kolom
+split_clean2_bio <- stri_split_fixed(asc_2_clean_bio$word," ",simplify = T)
+split_clean2_bio <- as.data.frame(split_clean2_bio)
+# simpan teks dengan kolom
+write.csv(split_clean2_bio,"split_bio2.csv",row.names = F)
+```
+
+```{r}
+# read data teks sebagai data transaction untuk dibuatkan model association rules
+trans_2_bio <- read.transactions("split_bio2.csv",sep = ",",header = T)
+# modeling association rules menggunakan algoritma apriori
+rules_2_bio <- apriori(trans_2_bio,parameter = list(supp = 0.1, conf = 0.5))
+# ubah hasil association rules menjadi dataframe
+bio_rules_2 <- data.frame(arules::inspect(rules_2_bio))
+# simpan hasil association rules
+write.csv(bio_rules_2,"rules2_biore.csv",row.names = F)
+
+```
+
+## word rules rating 1
+
+```{r}
+# clean text
+asc_1_bio <- textcleaner_asc(biore_1$review)
+asc_1_bio$id <- rownames(asc_1_bio)
+# simpan word dari topic modeling yang akan digunakan untuk membuat rules
+keepword_1_bio <- as.character(unique(topic_1_bio$term))
+
+# filter teks tiap review hanya mengambil word yang ada di keepword
+asc_1_token_bio <- unnest_tokens(asc_1_bio,word,x)
+asc_1_token_bio <- filter(asc_1_token_bio, word %in% keepword_1_bio)
+asc_1_clean_bio <- asc_1_token_bio %>% group_by(id) %>%
+  summarize(word = str_c(word,collapse = " "))
+```
+
+```{r}
+# mengubah tiap word yang sudah bersih menjadi kolom
+split_clean1_bio <- stri_split_fixed(asc_1_clean_bio$word," ",simplify = T)
+split_clean1_bio <- as.data.frame(split_clean1_bio)
+# simpan teks dengan kolom
+write.csv(split_clean1_bio,"split_bio1.csv",row.names = F)
+```
+
+```{r}
+# read data teks sebagai data transaction untuk dibuatkan model association rules
+trans_1_bio <- read.transactions("split_bio1.csv",sep = ",",header = T)
+# modeling association rules menggunakan algoritma apriori
+rules_1_bio <- apriori(trans_1_bio,parameter = list(supp = 0.1, conf = 0.5))
+# ubah hasil association rules menjadi dataframe
+bio_rules_1 <- data.frame(arules::inspect(rules_1_bio))
+# simpan hasil association rules
+write.csv(bio_rules_1,"rules1_biore.csv",row.names = F)
+
+```
+
+# Sentiment analysis
+Sentimen analysis melalui scoring sentimen negatif positif. score sentimen berdasarkan kata dari password yang sudah diberikan sentimen secara manual
+```{r}
+sentimen_indo_biore <- read.csv("password_biore_sent_2.csv")
+
+# set word sentimen positif
+sentimen_pos_biore <- sentimen_indo_biore %>% filter(sentiment == "positive")
+sentimen_pos_biore <- sentimen_pos_biore$term %>% str_trim() %>% str_squish() %>%
+  as.character()
+
+# set word sentimen negatif
+sentimen_neg_biore <- sentimen_indo_biore %>% filter(sentiment == "negative")
+sentimen_neg_biore <- sentimen_neg_biore$term %>% str_trim() %>% str_squish() %>%
+  as.character()
+```
+
+```{r}
+# buat function untuk scoring sentiment
+score.sentiment_biore = function(kalimat2, sentimen_pos_biore, sentimen_neg_biore, .progress='none')
+{
+  require(plyr)
+  require(stringr)
+  scores = laply(kalimat2, function(kalimat, sentimen_pos_biore, sentimen_neg_biore) {
+    # cleaning data teks  
+    kalimat = gsub('[[:punct:]]', '', kalimat)
+    kalimat = gsub('[[:cntrl:]]', '', kalimat)
+    kalimat = gsub('\\d+', '', kalimat)
+    kalimat = tolower(kalimat)
+    # list data berdasarkan tab
+    list.kata = str_split(kalimat, '\\s+')
+    # unlist per review
+    kata2 = unlist(list.kata)
+    # scoring positif dan negatif lalu menghapus NA
+    positif.matches = match(kata2, sentimen_pos_biore)
+    negatif.matches = match(kata2, sentimen_neg_biore)
+    positif.matches = !is.na(positif.matches)
+    negatif.matches = !is.na(negatif.matches)
+    score = sum(positif.matches) - (sum(negatif.matches))
+    return(score)
+  }, sentimen_pos_biore, sentimen_neg_biore, .progress=.progress )
+  scores.df = data.frame(score=scores, text=kalimat2)
+  return(scores.df)
+}
+```
+
+## Sentiment rating 5
+menagplikasikan function score sentiment lalu visualisasi berdasarkan jumlah sentiment yang didapat
+```{r}
+sentimen_5_biore <- score.sentiment_biore(biore_5$review,sentimen_pos_biore,sentimen_neg_biore)
+sentimen_5_biore$sentiment <- ifelse(sentimen_5_biore$score <=0,"Negatif","Positif") %>% as.factor()
+
+biore_sent_5 <-  data.frame(table(sentimen_5_biore$sentiment)) %>%
+  ggplot(aes(x = Var1, y = Freq)) +
+  geom_col(aes(fill = Var1)) + theme_minimal() +
+  geom_label(aes(label = scales::percent(Freq/length(sentimen_5_biore$text))),size = 4) +
+  geom_text(aes(label = Freq), nudge_y = 130, show.legend = F) +
+  labs(title = "Sentiment Produk Biore",
+       subtitle = "Rating review 5",
+       x = "Sentiment", y = "Frequency",
+       fill = "") +
+  theme(legend.position = "bottom")
+
+biore_sent_5
+```
+
+## Sentiment rating 4
+menagplikasikan function score sentiment lalu visualisasi berdasarkan jumlah sentiment yang didapat
+```{r}
+sentimen_4_biore <- score.sentiment_biore(biore_4$review,sentimen_pos_biore,sentimen_neg_biore)
+sentimen_4_biore$sentiment <- ifelse(sentimen_4_biore$score <=0,"Negatif","Positif") %>% as.factor()
+
+biore_sent_4 <-  data.frame(table(sentimen_4_biore$sentiment)) %>%
+  ggplot(aes(x = Var1, y = Freq)) +
+  geom_col(aes(fill = Var1)) + theme_minimal() +
+  geom_label(aes(label = scales::percent(Freq/length(sentimen_4_biore$text))),size = 4) +
+  geom_text(aes(label = Freq), nudge_y = 50, show.legend = F) +
+  labs(title = "Sentiment Produk Biore",
+       subtitle = "Rating review 4",
+       x = "Sentiment", y = "Frequency",
+       fill = "") +
+  theme(legend.position = "bottom")
+
+biore_sent_4
+```
+## Sentiment rating 3
+menagplikasikan function score sentiment lalu visualisasi berdasarkan jumlah sentiment yang didapat
+```{r}
+sentimen_3_biore <- score.sentiment_biore(biore_3$review,sentimen_pos_biore,sentimen_neg_biore)
+sentimen_3_biore$sentiment <- ifelse(sentimen_3_biore$score <=0,"Negatif","Positif") %>% as.factor()
+
+biore_sent_3 <-  data.frame(table(sentimen_3_biore$sentiment)) %>%
+  ggplot(aes(x = Var1, y = Freq)) +
+  geom_col(aes(fill = Var1)) + theme_minimal() +
+  geom_label(aes(label = scales::percent(Freq/length(sentimen_3_biore$text))),size = 4) +
+  geom_text(aes(label = Freq), nudge_y = 20, show.legend = F) +
+  labs(title = "Sentiment Produk Biore",
+       subtitle = "Rating review 3",
+       x = "Sentiment", y = "Frequency",
+       fill = "") +
+  theme(legend.position = "bottom")
+
+biore_sent_3
+```
+
+## Sentiment rating 2
+menagplikasikan function score sentiment lalu visualisasi berdasarkan jumlah sentiment yang didapat
+```{r}
+sentimen_2_biore <- score.sentiment_biore(biore_2$review,sentimen_pos_biore,sentimen_neg_biore)
+sentimen_2_biore$sentiment <- ifelse(sentimen_2_biore$score <=0,"Negatif","Positif") %>% as.factor()
+
+biore_sent_2 <-  data.frame(table(sentimen_2_biore$sentiment)) %>%
+  ggplot(aes(x = Var1, y = Freq)) +
+  geom_col(aes(fill = Var1)) + theme_minimal() +
+  geom_label(aes(label = scales::percent(Freq/length(sentimen_2_biore$text))),size = 4) +
+  geom_text(aes(label = Freq), nudge_y = 10, show.legend = F) +
+  labs(title = "Sentiment Produk Biore",
+       subtitle = "Rating review 2",
+       x = "Sentiment", y = "Frequency",
+       fill = "") +
+  theme(legend.position = "bottom")
+
+biore_sent_2
+```
+
+## Sentiment rating 1
+menagplikasikan function score sentiment lalu visualisasi berdasarkan jumlah sentiment yang didapat
+```{r}
+sentimen_1_biore <- score.sentiment_biore(biore_1$review,sentimen_pos_biore,sentimen_neg_biore)
+sentimen_1_biore$sentiment <- ifelse(sentimen_1_biore$score <=0,"Negatif","Positif") %>% as.factor()
+
+biore_sent_1 <-  data.frame(table(sentimen_1_biore$sentiment)) %>%
+  ggplot(aes(x = Var1, y = Freq)) +
+  geom_col(aes(fill = Var1)) + theme_minimal() +
+  geom_label(aes(label = scales::percent(Freq/length(sentimen_1_biore$text))),size = 4) +
+  geom_text(aes(label = Freq), nudge_y = 5, show.legend = F) +
+  labs(title = "Sentiment Produk Biore",
+       subtitle = "Rating review 1",
+       x = "Sentiment", y = "Frequency",
+       fill = "") +
+  theme(legend.position = "bottom")
+
+biore_sent_1
+```
+# Prediksi rating berdasarkan review
+
+membuat function cleaning teks dengan tambahan password sebagai controler kolom. kata yang ada di password akan menjadi kolom prediktor
+```{r}
+textcleaner_clf_biore <- function(x){
+  x <- as.character(x)
+  
+  x <- x %>%
+    str_to_lower() %>%  # convert all the string to low alphabet
+    replace_contraction() %>% # replace contraction to their multi-word forms
+    replace_internet_slang() %>% # replace internet slang to normal words
+    replace_emoji() %>% # replace emoji to words
+    replace_emoticon() %>% # replace emoticon to words
+    replace_hash(replacement = "") %>% # remove hashtag
+    replace_word_elongation() %>% # replace informal writing with known semantic replacements
+    replace_number(remove = T) %>% # remove number
+    replace_date(replacement = "") %>% # remove date
+    replace_time(replacement = "") %>% # remove time
+    str_remove_all(pattern = "[[:punct:]]") %>% # remove punctuation
+    str_remove_all(pattern = "[^\\s]*[0-9][^\\s]*") %>% # remove mixed string n number
+    str_squish() %>% # reduces repeated whitespace inside a string.
+    str_trim() # removes whitespace from start and end of string
+  
+  xdtm <- VCorpus(VectorSource(x)) %>%
+    tm_map(removeWords, stopwords("en")) %>%
+    tm_map(removeWords, bahasa.sw) %>%
+    tm_map(removePunctuation) %>%
+    tm_map(content_transformer(stemmword)) %>%
+    tm_map(content_transformer(slangword))
+  
+  # mengubah corpus menjadi document term matrix
+  return(DocumentTermMatrix(xdtm,control = list(
+    dictionary = password_biore$term
+  )))
+}
+```
+
+## proses cleaning
+```{r}
+# mengaplikasikan function textclean ke review produk
+review_biore.dtm <- textcleaner_clf_biore(biore$review)
+```
+
+```{r}
+# mengubah term matrix menjadi dataframe untuk modeling
+biore.clean <- as.data.frame(as.matrix(review_biore.dtm), stringsAsFactors = F)
+# we have 300+ variable in words form. i change the label name from `mood` to labelY to avoid overwriting column names
+new.biore <- cbind(biore.clean, data.frame(labelY = biore$rating))
+# hasil data bersih yang sudah diberi token
+# tiap baris menunjukkan 1 review user
+head(new.biore)
+```
+
+## Modeling
+Untuk menjawab pertanyaan penelitian 3, dilakukan modeling dengan algoritma Naive Bayes dan Random Forest (more model soon). Akurasi model didapat dari prediksi test data (unseen data). **Note:** metode yang dilakukan ada klasifikasi, jadi rating dianggap tidak mempunyai level. rating 1 akan dianggap sama dengan rating 5 and vice versa
+
+### splitting
+split data menjadi data train dan test dengan proporsi 75% dan 25%. data train digunakan untuk membangun model dan test untuk evaluasi model (prediksi)
+```{r}
+set.seed(1502) # making sample reproduciable
+splitter_bio <- initial_split(new.biore, prop = 0.75, strata = "labelY")
+train_bio <- training(splitter_bio)
+test_bio <- testing(splitter_bio)
+```
+
+
+### Naive Bayes
+Naive bayes membutuhkan format data yang berbeda. Naive bayes tidak membutuhkan frekuensi token. token hanya berisi 1 dan 0, 1 menunjukkan kata tersebut ada didalam kalimat dan 0 brarti tidak ada kehadiran kata tersebut
+```{r}
+# split the data. 75% for train data, and 25% for test data
+set.seed(1502)
+index_b <- sample(1:nrow(review_biore.dtm), 0.75*nrow(review_biore.dtm))
+
+train_x_bio <- review_biore.dtm[index_b,]
+test_x_bio <- review_biore.dtm[-index_b,]
+# subset label/target variable
+train_label_bio <- biore[index_b,"rating"]
+test_label_bio <- biore[-index_b,"rating"]
+```
+
+Use bernoulli converter to convert any value above 0 to 1 and 0 to remain 0.
+```{r}
+# bernoulli conv 
+bernoulli_conv <- function(x){
+  x <- as.factor(as.numeric(x>0))
+}
+```
+
+apply bernoulli converter to train and test data
+```{r}
+train_x_bio <- apply(train_x_bio,2,bernoulli_conv)
+test_x_bio <- apply(test_x_bio,2,bernoulli_conv)
+```
+
+Membangun model naive bayes
+```{r}
+# train the model
+mod.nb_bio <- naiveBayes(train_x_bio, as.factor(train_label_bio), laplace = 1)
+
+# predict to test data
+pred.nb_bio <- predict(mod.nb_bio, test_x_bio,
+                   type = "class")
+
+pred.nb_bio.x <- cbind(data.frame(pred.nb_bio),as.factor(test_label_bio))%>%
+  setNames(c("pred","actual"))
+
+pred.nb_bio.x
+```
+
+Membuat confusion matrix untuk evaluasi hasil prediksi model
+```{r}
+cf.nb_bio <- confusionMatrix(data = pred.nb_bio.x$pred,
+                         reference = pred.nb_bio.x$actual)
+cf.nb_bio
+```
+
+### Random Forest
+model random forest dengan mesin `ranger` tidak dapat menerima nama kolom dengan special character seperti for, break, next, return, dll. Perlu dilakukan koversi nama kolom menjadi nama yang bukan special character
+```{r}
+# this chunks are made for random forest model and future model tuning
+## the column names like break,for,next,if are considered as special character thus raises an error when building random forest and model tuning.
+## i store the train and test data to new variabel so the old one remain reproducible
+train_tune_bio <- train_bio
+test_tune_bio <- test_bio
+
+colnames(train_tune_bio) <- make.names(colnames(train_tune_bio))
+colnames(test_tune_bio) <- make.names(colnames(test_tune_bio))
+
+# build 5 folds cross validation for tuning evaluation
+set.seed(1502)
+folds <- vfold_cv(train_tune_bio, 5)
+```
+
+Membangun model Random Forest
+```{r}
+mod.rf_bio <- rand_forest(trees = 500, mtry = 5, mode = "classification") %>%
+  set_engine("ranger") %>% fit(labelY~., data = train_tune_bio)
+
+pred.rf_bio <- predict(mod.rf_bio, test_tune_bio, 
+                   type = "class")
+
+pred.rf.x_bio <- as.data.frame(cbind(pred.rf_bio, test_tune_bio$labelY)) %>%
+  setNames(c("pred","actual"))
+
+pred.rf.x_bio
+```
+
+Membuat confusion matrix untuk evaluasi hasil prediksi model
+```{r}
+cf.rf_bio <- confusionMatrix(data = pred.rf.x_bio$pred,
+                         reference = pred.rf.x_bio$actual)
+cf.rf_bio
+```
+
+# Kesimpulan Biore
+
+
+
+
+

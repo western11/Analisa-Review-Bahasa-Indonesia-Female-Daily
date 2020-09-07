@@ -1,0 +1,928 @@
+---
+title: "wardah"
+author: "jojoecp"
+date: "6/20/2020"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+
+# Background {.tabset}
+## Objective
+Projek ini bertujuan untuk:   
+- Mencari topik yang dibicarakan user FemaleDaily.com pada setiap rating (topic modeling)   
+- Bagaimana Sentiment yang diberikan user dapat memprediksi rating   
+- Membangun model dengan akurasi terbaik dalam memprediksi rating produk
+
+Data bersumber dari FemaleDaily.com dengan 3 produk yang berbeda. Data berisi review (teks) dan rating pengguna berbahasa Indonesia. Data akan diolah terpisah untuk menjawab pertanyaan penelitian/objective dari projek
+
+## Library
+Berikut library yang digunakan. jika library tidak tersedia lakukan
+
+
+```{r}
+#install.packages("dplyr")
+```
+
+```{r warning=FALSE, message=FALSE}
+# Data wrangling
+library(plyr)
+library(dplyr)
+# Text manipulation and cleaning
+library(textclean)
+library(tm)
+library(SnowballC)
+library(stringr)
+library(stringi)
+# Topic models
+library(topicmodels)
+library(tidytext)
+# Visualization
+library(ggplot2)
+library(scales)
+# Association rules
+library(arules)
+# Modeling and classification
+library(e1071)
+library(parsnip)
+library(yardstick)
+library(caret)
+library(rsample)
+```
+
+# Data import
+```{r}
+wardah <- read.csv("wardah1.csv")
+wardah <- setNames(wardah,c("review","rating")) %>%
+  na.omit()
+wardah$rating <- as.factor(wardah$rating)
+table(wardah$rating)
+```
+
+import stopwords bahasa Indonesia
+```{r}
+# add custom bahasa stopwords
+bahasa.sw <- read.csv("Bahasa.stopwords.csv", header = F,fileEncoding = "UTF-8-BOM")
+bahasa.sw <- as.character(bahasa.sw$V1)
+bahasa.sw <- c(bahasa.sw, stopwords())
+```
+
+Import stemming dan slangword converter bahasa Indonesia
+```{r}
+# add custom stemming and slangword bahasa indonesia
+stemm_indo <- read.csv("Stemming 2.csv",sep = ";")
+oldstem <- as.character(stemm_indo$old)
+newstem <- as.character(stemm_indo$new)
+
+slang_indo <- read.csv("Slangword2.csv",sep = ";")
+oldslang <- as.character(slang_indo$old)
+newslang <- as.character(slang_indo$new)
+```
+
+# Text Cleaning
+Teks perlu dibersihkan sebelum dilakukan topic modeling dan prediksi. Tahap pembersihan yang dilakukan adalah:    
+- Mengubah seluruh teks menjadi huruf kecil (lower)   
+- Mengubah contraction (contoh: i've -> i have, you're -> you are)   
+- mengubah slang words (contoh: gw -> aku, bgt -> banget, bagussss -> bagus)   
+- menghapus emoji, emoticon, hash, angka, date, time, dan punctuation (/ , . " ;)   
+- menghapus spasi berlebih antar kata (whitespace)   
+- menghapus imbuhan (contoh: membeli -> beli, harganya -> harga)   
+Setelah dibersihkan, data lalu dirubah ke bentuk corpus dan melakukan tokenization (perhitungan jumlah per kata dalam tiap review). Proses pembersihan sampai pembentukan corpus dibuat kedalam function `textcleaner` agar function bisa digunakan untuk tahapan selanjutnya. 
+
+## membuat `textcleaner` function
+```{r}
+# membuat function untuk stemming bahasa Indonesia
+stemmword <- function(x) Reduce(function(x,r) gsub(stemm_indo$old[r],stemm_indo$new[r],x,fixed=T),
+seq_len(nrow(stemm_indo)),x)
+
+# membuat function untuk konversi slangword bahasa Indonesia
+slangword <- function(x) Reduce(function(x,r) gsub(slang_indo$old[r],slang_indo$new[r],x,fixed=T),
+seq_len(nrow(slang_indo)),x)
+
+# membuat function textcleaner
+textcleaner <- function(x){
+  x <- as.character(x)
+  
+  x <- x %>%
+    str_to_lower() %>%  # convert all the string to low alphabet
+    replace_contraction() %>% # replace contraction to their multi-word forms
+    replace_internet_slang() %>% # replace internet slang to normal words
+    replace_emoji() %>% # replace emoji to words
+    replace_emoticon() %>% # replace emoticon to words
+    replace_hash(replacement = "") %>% # remove hashtag
+    replace_word_elongation() %>% # replace informal writing with known semantic replacements
+    replace_number(remove = T) %>% # remove number
+    replace_date(replacement = "") %>% # remove date
+    replace_time(replacement = "") %>% # remove time
+    str_remove_all(pattern = "[[:punct:]]") %>% # remove punctuation
+    str_remove_all(pattern = "[^\\s]*[0-9][^\\s]*") %>% # remove mixed string n number
+    str_squish() %>% # reduces repeated whitespace inside a string.
+    str_trim() # removes whitespace from start and end of string
+  
+  xdtm <- VCorpus(VectorSource(x)) %>%
+    tm_map(removeWords, stopwords("en")) %>%
+    tm_map(removeWords, bahasa.sw) %>%
+    tm_map(removePunctuation) %>%
+    tm_map(content_transformer(stemmword)) %>%
+    tm_map(content_transformer(slangword))
+  
+  # mengubah corpus menjadi document term matrix
+  return(DocumentTermMatrix(xdtm))
+    
+}
+
+```
+
+# Topic Modeling
+Topic modeling dilakukan untuk menjawab pertanyaan penelitian nomor 1, yaitu **Apa topik yang dibicarakan user FemaleDaily.com pada setiap rating?** Algoritma yang digunakan untuk mencari topic modeling adalah *Latent Dirichlet Allocation (LDA)*. LDA adalah model matematika yang digunakan untuk menemukan campuran kata yang terkait dengan setiap topik, juga menentukan campuran topik yang menggambarkan setiap dokumen. LDA bekerja untuk menjawab 2 prinsip topic modeling berikut:   
+
+- Every document is a mixture of topics   
+- Every topic is a mixture of words   
+
+Memisahkan review berdasarkan rating
+```{r}
+wardah_1 <- wardah %>% filter(rating == 1)
+wardah_2 <- wardah %>% filter(rating == 2)
+wardah_3 <- wardah %>% filter(rating == 3)
+wardah_4 <- wardah %>% filter(rating == 4)
+wardah_5 <- wardah %>% filter(rating == 5)
+```
+
+## Topic modeling rating 5
+Sebelum melakukan topic modeling, perlu dilakukan pembersihan teks sama seperti modeling prediksi di tahap sebelumnya. Di modeling prediksi pembersihan dilakukan seara menyeluruh tanpa melihat rating. Disini dilakukan pembersihan ulang dengan data yang sudah di subset. Pengerjan topic modeling akan dibuat 5x sesuai banyak rating
+
+Proses pembersihan teks
+```{r}
+# mengaplikasikan function textcleaner pada review dengan rating 5
+war_5_dtm <- textcleaner(wardah_5$review)
+# Filter kata yang ada di lebih dari 3 review
+freqwar_5 <- findFreqTerms(war_5_dtm, 3)
+war_5_dtm <- war_5_dtm[,freqwar_5]
+# setelah filtering akan ada data sisa tanpa isi token. data sperti itu akan dihilangkan
+row_war5 <- apply(war_5_dtm,1,sum)
+war_5_dtm <- war_5_dtm[row_war5>0,]
+```
+
+mengaplikasikan algoritma LDA untuk mencari topic modeling. Disini akan dibuat 2 topik pembicaraan pada setiap rating
+```{r}
+lda_5_war <- LDA(war_5_dtm, k = 2, control = list(seed=1502))
+topic_5_war <- tidy(lda_5_war,matrix="beta")
+```
+
+Membuat visualisasi topik yang dibicarakan
+```{r}
+top_war_5 <- topic_5_war %>%
+  group_by(topic) %>%
+  top_n(15, beta) %>%
+  ungroup() %>%
+  arrange(topic, -beta)
+
+war_topic_5 <- top_war_5 %>%
+  mutate(term = reorder_within(term, beta, topic)) %>%
+  ggplot(aes(term, beta, fill = factor(topic))) +
+  geom_col(show.legend = FALSE) +
+  facet_wrap(~ topic, scales = "free") +
+  coord_flip() +
+  scale_x_reordered() +
+  labs(title = "Topik pembicaraan pada review di rating 5 FemaleDaily",
+       subtitle = "Produk sunscreen Wardah")
+
+war_topic_5
+```
+
+mengambil average dari beta tiap kata yang muncul dalam topic modeling, lalu mengambil average beta tertinggi. kata yang tersimpan nanti akan digabungkan dengan kata topic modeling semua rating sebagai prediktor pada tahap prediksi
+```{r}
+word_5_war <- topic_5_war %>% group_by(term) %>%
+  dplyr::summarise(mean_beta = mean(beta)) %>%
+  arrange(-mean_beta) %>% select("term") %>% slice(1:250)
+
+word_5_war
+```
+
+## Topic modeling rating 4
+Sebelum melakukan topic modeling, perlu dilakukan pembersihan teks sama seperti modeling prediksi di tahap sebelumnya. Di modeling prediksi pembersihan dilakukan seara menyeluruh tanpa melihat rating. Disini dilakukan pembersihan ulang dengan data yang sudah di subset. Pengerjan topic modeling akan dibuat 5x sesuai banyak rating
+
+Proses pembersihan teks
+```{r}
+# mengaplikasikan function textcleaner pada review dengan rating 4
+war_4_dtm <- textcleaner(wardah_4$review)
+# Filter kata yang ada di lebih dari 5 review
+freqwar_4 <- findFreqTerms(war_4_dtm, 5)
+war_4_dtm <- war_4_dtm[,freqwar_4]
+# setelah filtering akan ada data sisa tanpa isi token. data sperti itu akan dihilangkan
+row_war4 <- apply(war_4_dtm,1,sum)
+war_4_dtm <- war_4_dtm[row_war4>0,]
+```
+
+mengaplikasikan algoritma LDA untuk mencari topic modeling. Disini akan dibuat 2 topik pembicaraan pada setiap rating
+```{r}
+lda_4_war <- LDA(war_4_dtm, k = 2, control = list(seed=1502))
+topic_4_war <- tidy(lda_4_war,matrix="beta")
+```
+
+Membuat visualisasi topik yang dibicarakan
+```{r}
+top_war_4 <- topic_4_war %>%
+  group_by(topic) %>%
+  top_n(15, beta) %>%
+  ungroup() %>%
+  arrange(topic, -beta)
+
+war_topic_4 <- top_war_4 %>%
+  mutate(term = reorder_within(term, beta, topic)) %>%
+  ggplot(aes(term, beta, fill = factor(topic))) +
+  geom_col(show.legend = FALSE) +
+  facet_wrap(~ topic, scales = "free") +
+  coord_flip() +
+  scale_x_reordered() +
+  labs(title = "Topik pembicaraan pada review di rating 4 FemaleDaily",
+       subtitle = "Produk sunscreen Wardah")
+
+war_topic_4
+```
+
+mengambil average dari beta tiap kata yang muncul dalam topic modeling, lalu mengambil average beta tertinggi. kata yang tersimpan nanti akan digabungkan dengan kata topic modeling semua rating sebagai prediktor pada tahap prediksi
+```{r}
+word_4_war <- topic_4_war %>% group_by(term) %>%
+  dplyr::summarise(mean_beta = mean(beta)) %>%
+  arrange(-mean_beta) %>% select("term") %>% slice(1:250)
+
+word_4_war
+```
+
+## Topic modeling rating 3
+Sebelum melakukan topic modeling, perlu dilakukan pembersihan teks sama seperti modeling prediksi di tahap sebelumnya. Di modeling prediksi pembersihan dilakukan seara menyeluruh tanpa melihat rating. Disini dilakukan pembersihan ulang dengan data yang sudah di subset. Pengerjan topic modeling akan dibuat 5x sesuai banyak rating
+
+Proses pembersihan teks
+```{r}
+# mengaplikasikan function textcleaner pada review dengan rating 4
+war_3_dtm <- textcleaner(wardah_3$review)
+# Filter kata yang ada di lebih dari 5 review
+freqwar_3 <- findFreqTerms(war_3_dtm, 5)
+war_3_dtm <- war_3_dtm[,freqwar_3]
+# setelah filtering akan ada data sisa tanpa isi token. data sperti itu akan dihilangkan
+row_war3 <- apply(war_3_dtm,1,sum)
+war_3_dtm <- war_3_dtm[row_war3>0,]
+```
+
+mengaplikasikan algoritma LDA untuk mencari topic modeling. Disini akan dibuat 2 topik pembicaraan pada setiap rating
+```{r}
+lda_3_war <- LDA(war_3_dtm, k = 2, control = list(seed=1502))
+topic_3_war <- tidy(lda_3_war,matrix="beta")
+```
+
+Membuat visualisasi topik yang dibicarakan
+```{r}
+top_war_3 <- topic_3_war %>%
+  group_by(topic) %>%
+  top_n(15, beta) %>%
+  ungroup() %>%
+  arrange(topic, -beta)
+
+war_topic_3 <- top_war_3 %>%
+  mutate(term = reorder_within(term, beta, topic)) %>%
+  ggplot(aes(term, beta, fill = factor(topic))) +
+  geom_col(show.legend = FALSE) +
+  facet_wrap(~ topic, scales = "free") +
+  coord_flip() +
+  scale_x_reordered() +
+  labs(title = "Topik pembicaraan pada review di rating 3 FemaleDaily",
+       subtitle = "Produk sunscreen Wardah")
+
+war_topic_3
+```
+
+mengambil average dari beta tiap kata yang muncul dalam topic modeling, lalu mengambil average beta tertinggi. kata yang tersimpan nanti akan digabungkan dengan kata topic modeling semua rating sebagai prediktor pada tahap prediksi
+```{r}
+word_3_war <- topic_3_war %>% group_by(term) %>%
+  dplyr::summarise(mean_beta = mean(beta)) %>%
+  arrange(-mean_beta) %>% select("term") %>% slice(1:250)
+
+word_3_war
+```
+
+## Topic modeling rating 2
+Sebelum melakukan topic modeling, perlu dilakukan pembersihan teks sama seperti modeling prediksi di tahap sebelumnya. Di modeling prediksi pembersihan dilakukan seara menyeluruh tanpa melihat rating. Disini dilakukan pembersihan ulang dengan data yang sudah di subset. Pengerjan topic modeling akan dibuat 5x sesuai banyak rating
+
+Proses pembersihan teks
+```{r}
+# mengaplikasikan function textcleaner pada review dengan rating 2
+war_2_dtm <- textcleaner(wardah_2$review)
+# Filter kata yang ada di lebih dari 5 review
+freqwar_2 <- findFreqTerms(war_2_dtm, 4)
+war_2_dtm <- war_2_dtm[,freqwar_2]
+# setelah filtering akan ada data sisa tanpa isi token. data sperti itu akan dihilangkan
+row_war2 <- apply(war_2_dtm,1,sum)
+war_2_dtm <- war_2_dtm[row_war2>0,]
+```
+
+mengaplikasikan algoritma LDA untuk mencari topic modeling. Disini akan dibuat 2 topik pembicaraan pada setiap rating
+```{r}
+lda_2_war <- LDA(war_2_dtm, k = 2, control = list(seed=1502))
+topic_2_war <- tidy(lda_2_war,matrix="beta")
+```
+
+Membuat visualisasi topik yang dibicarakan
+```{r}
+top_war_2 <- topic_2_war %>%
+  group_by(topic) %>%
+  top_n(15, beta) %>%
+  ungroup() %>%
+  arrange(topic, -beta)
+
+war_topic_2 <- top_war_2 %>%
+  mutate(term = reorder_within(term, beta, topic)) %>%
+  ggplot(aes(term, beta, fill = factor(topic))) +
+  geom_col(show.legend = FALSE) +
+  facet_wrap(~ topic, scales = "free") +
+  coord_flip() +
+  scale_x_reordered() +
+  labs(title = "Topik pembicaraan pada review di rating 2 FemaleDaily",
+       subtitle = "Produk sunscreen Wardah")
+
+war_topic_2
+```
+
+mengambil average dari beta tiap kata yang muncul dalam topic modeling, lalu mengambil average beta tertinggi. kata yang tersimpan nanti akan digabungkan dengan kata topic modeling semua rating sebagai prediktor pada tahap prediksi
+```{r}
+word_2_war <- topic_2_war %>% group_by(term) %>%
+  dplyr::summarise(mean_beta = mean(beta)) %>%
+  arrange(-mean_beta) %>% select("term") %>% slice(1:250)
+
+word_2_war
+```
+
+## Topic modeling rating 1
+Sebelum melakukan topic modeling, perlu dilakukan pembersihan teks sama seperti modeling prediksi di tahap sebelumnya. Di modeling prediksi pembersihan dilakukan seara menyeluruh tanpa melihat rating. Disini dilakukan pembersihan ulang dengan data yang sudah di subset. Pengerjan topic modeling akan dibuat 5x sesuai banyak rating
+
+Proses pembersihan teks
+```{r}
+# mengaplikasikan function textcleaner pada review dengan rating 1
+war_1_dtm <- textcleaner(wardah_1$review)
+# Filter kata yang ada di lebih dari 3 review
+freqwar_1 <- findFreqTerms(war_1_dtm, 3)
+war_1_dtm <- war_1_dtm[,freqwar_1]
+# setelah filtering akan ada data sisa tanpa isi token. data sperti itu akan dihilangkan
+row_war1 <- apply(war_1_dtm,1,sum)
+war_1_dtm <- war_1_dtm[row_war1>0,]
+```
+
+mengaplikasikan algoritma LDA untuk mencari topic modeling. Disini akan dibuat 2 topik pembicaraan pada setiap rating
+```{r}
+lda_1_war <- LDA(war_1_dtm, k = 2, control = list(seed=1502))
+topic_1_war <- tidy(lda_1_war,matrix="beta")
+```
+
+Membuat visualisasi topik yang dibicarakan
+```{r}
+top_war_1 <- topic_1_war %>%
+  group_by(topic) %>%
+  top_n(15, beta) %>%
+  ungroup() %>%
+  arrange(topic, -beta)
+
+war_topic_1 <- top_war_1 %>%
+  mutate(term = reorder_within(term, beta, topic)) %>%
+  ggplot(aes(term, beta, fill = factor(topic))) +
+  geom_col(show.legend = FALSE) +
+  facet_wrap(~ topic, scales = "free") +
+  coord_flip() +
+  scale_x_reordered() +
+  labs(title = "Topik pembicaraan pada review di rating 1 FemaleDaily",
+       subtitle = "Produk sunscreen Wardah")
+
+war_topic_1
+```
+
+mengambil average dari beta tiap kata yang muncul dalam topic modeling, lalu mengambil average beta tertinggi. kata yang tersimpan nanti akan digabungkan dengan kata topic modeling semua rating sebagai prediktor pada tahap prediksi
+```{r}
+word_1_war <- topic_1_war %>% group_by(term) %>%
+  dplyr::summarise(mean_beta = mean(beta)) %>%
+  arrange(-mean_beta) %>% select("term") %>% slice(1:200)
+
+word_1_war
+```
+
+## membuat password
+menggabungkan semua highest beta average word dari ke-5 rating
+```{r}
+password_wardah <- rbind(word_1_war,word_2_war,word_3_war,word_4_war,word_5_war)
+# remove duplicate rows
+password_wardah <- password_wardah[!duplicated(password_wardah),]
+```
+
+# Text Association Rules based on topic modeling
+
+text cleaner tanpa dtm dan stopword
+```{r}
+# membuat function textcleaner
+textcleaner_asc <- function(x){
+  x <- as.character(x)
+  
+  x <- x %>%
+    str_to_lower() %>%  # convert all the string to low alphabet
+    replace_contraction() %>% # replace contraction to their multi-word forms
+    replace_internet_slang() %>% # replace internet slang to normal words
+    replace_emoji() %>% # replace emoji to words
+    replace_emoticon() %>% # replace emoticon to words
+    replace_hash(replacement = "") %>% # remove hashtag
+    replace_word_elongation() %>% # replace informal writing with known semantic replacements
+    replace_number(remove = T) %>% # remove number
+    replace_date(replacement = "") %>% # remove date
+    replace_time(replacement = "") %>% # remove time
+    str_remove_all(pattern = "[[:punct:]]") %>% # remove punctuation
+    str_remove_all(pattern = "[^\\s]*[0-9][^\\s]*") %>% # remove mixed string n number
+    str_squish() %>% # reduces repeated whitespace inside a string.
+    str_trim() # removes whitespace from start and end of string
+  
+  return(as.data.frame(x))
+    
+}
+
+```
+
+## word rules rating 5
+
+```{r}
+# clean text
+asc_5_war <- textcleaner_asc(wardah_5$review)
+asc_5_war$id <- rownames(asc_5_war)
+# simpan word dari topic modeling yang akan digunakan untuk membuat rules
+keepword_5_war <- as.character(unique(topic_5_war$term))
+
+# filter teks tiap review hanya mengambil word yang ada di keepword
+asc_5_token_war <- unnest_tokens(asc_5_war,word,x)
+asc_5_token_war <- filter(asc_5_token_war, word %in% keepword_5_war)
+asc_5_clean_war <- asc_5_token_war %>% group_by(id) %>%
+  summarize(word = str_c(word,collapse = " "))
+```
+
+```{r}
+# mengubah tiap word yang sudah bersih menjadi kolom
+split_clean5_war <- stri_split_fixed(asc_5_clean_war$word," ",simplify = T)
+split_clean5_war <- as.data.frame(split_clean5_war)
+# simpan teks dengan kolom
+write.csv(split_clean5_war,"split_war5.csv",row.names = F)
+```
+
+```{r}
+# read data teks sebagai data transaction untuk dibuatkan model association rules
+trans_5_war <- read.transactions("split_war5.csv",sep = ",",header = T)
+# modeling association rules menggunakan algoritma apriori
+rules_5_war <- apriori(trans_5_war,parameter = list(supp = 0.1, conf = 0.5))
+# ubah hasil association rules menjadi dataframe
+war_rules_5 <- data.frame(arules::inspect(rules_5_war))
+# simpan hasil association rules
+write.csv(war_rules_5,"rules5_wardah.csv",row.names = F)
+
+```
+
+## word rules rating 4
+
+```{r}
+# clean text
+asc_4_war <- textcleaner_asc(wardah_4$review)
+asc_4_war$id <- rownames(asc_4_war)
+# simpan word dari topic modeling yang akan digunakan untuk membuat rules
+keepword_4_war <- as.character(unique(topic_4_war$term))
+
+# filter teks tiap review hanya mengambil word yang ada di keepword
+asc_4_token_war <- unnest_tokens(asc_4_war,word,x)
+asc_4_token_war <- filter(asc_4_token_war, word %in% keepword_4_war)
+asc_4_clean_war <- asc_4_token_war %>% group_by(id) %>%
+  summarize(word = str_c(word,collapse = " "))
+```
+
+```{r}
+# mengubah tiap word yang sudah bersih menjadi kolom
+split_clean4_war <- stri_split_fixed(asc_4_clean_war$word," ",simplify = T)
+split_clean4_war <- as.data.frame(split_clean4_war)
+# simpan teks dengan kolom
+write.csv(split_clean4_war,"split_war4.csv",row.names = F)
+```
+
+```{r}
+# read data teks sebagai data transaction untuk dibuatkan model association rules
+trans_4_war <- read.transactions("split_war4.csv",sep = ",",header = T)
+# modeling association rules menggunakan algoritma apriori
+rules_4_war <- apriori(trans_4_war,parameter = list(supp = 0.1, conf = 0.5))
+# ubah hasil association rules menjadi dataframe
+war_rules_4 <- data.frame(arules::inspect(rules_4_war))
+# simpan hasil association rules
+write.csv(war_rules_4,"rules4_wardah.csv",row.names = F)
+
+```
+
+## word rules rating 3
+
+```{r}
+# clean text
+asc_3_war <- textcleaner_asc(wardah_3$review)
+asc_3_war$id <- rownames(asc_3_war)
+# simpan word dari topic modeling yang akan digunakan untuk membuat rules
+keepword_3_war <- as.character(unique(topic_3_war$term))
+
+# filter teks tiap review hanya mengambil word yang ada di keepword
+asc_3_token_war <- unnest_tokens(asc_3_war,word,x)
+asc_3_token_war <- filter(asc_3_token_war, word %in% keepword_3_war)
+asc_3_clean_war <- asc_3_token_war %>% group_by(id) %>%
+  summarize(word = str_c(word,collapse = " "))
+```
+
+```{r}
+# mengubah tiap word yang sudah bersih menjadi kolom
+split_clean3_war <- stri_split_fixed(asc_3_clean_war$word," ",simplify = T)
+split_clean3_war <- as.data.frame(split_clean3_war)
+# simpan teks dengan kolom
+write.csv(split_clean3_war,"split_war3.csv",row.names = F)
+```
+
+```{r}
+# read data teks sebagai data transaction untuk dibuatkan model association rules
+trans_3_war <- read.transactions("split_war3.csv",sep = ",",header = T)
+# modeling association rules menggunakan algoritma apriori
+rules_3_war <- apriori(trans_3_war,parameter = list(supp = 0.1, conf = 0.5))
+# ubah hasil association rules menjadi dataframe
+war_rules_3 <- data.frame(arules::inspect(rules_3_war))
+# simpan hasil association rules
+write.csv(war_rules_3,"rules3_wardah.csv",row.names = F)
+
+```
+
+
+## word rules rating 2
+
+```{r}
+# clean text
+asc_2_war <- textcleaner_asc(wardah_2$review)
+asc_2_war$id <- rownames(asc_2_war)
+# simpan word dari topic modeling yang akan digunakan untuk membuat rules
+keepword_2_war <- as.character(unique(topic_2_war$term))
+
+# filter teks tiap review hanya mengambil word yang ada di keepword
+asc_2_token_war <- unnest_tokens(asc_2_war,word,x)
+asc_2_token_war <- filter(asc_2_token_war, word %in% keepword_2_war)
+asc_2_clean_war <- asc_2_token_war %>% group_by(id) %>%
+  summarize(word = str_c(word,collapse = " "))
+```
+
+```{r}
+# mengubah tiap word yang sudah bersih menjadi kolom
+split_clean2_war <- stri_split_fixed(asc_2_clean_war$word," ",simplify = T)
+split_clean2_war <- as.data.frame(split_clean2_war)
+# simpan teks dengan kolom
+write.csv(split_clean2_war,"split_war2.csv",row.names = F)
+```
+
+```{r}
+# read data teks sebagai data transaction untuk dibuatkan model association rules
+trans_2_war <- read.transactions("split_war2.csv",sep = ",",header = T)
+# modeling association rules menggunakan algoritma apriori
+rules_2_war <- apriori(trans_2_war,parameter = list(supp = 0.1, conf = 0.5))
+# ubah hasil association rules menjadi dataframe
+war_rules_2 <- data.frame(arules::inspect(rules_2_war))
+# simpan hasil association rules
+write.csv(war_rules_2,"rules2_wardah.csv",row.names = F)
+
+```
+
+
+## word rules rating 1
+
+```{r}
+# clean text
+asc_1_war <- textcleaner_asc(wardah_1$review)
+asc_1_war$id <- rownames(asc_1_war)
+# simpan word dari topic modeling yang akan digunakan untuk membuat rules
+keepword_1_war <- as.character(unique(topic_1_war$term))
+
+# filter teks tiap review hanya mengambil word yang ada di keepword
+asc_1_token_war <- unnest_tokens(asc_1_war,word,x)
+asc_1_token_war <- filter(asc_1_token_war, word %in% keepword_1_war)
+asc_1_clean_war <- asc_1_token_war %>% group_by(id) %>%
+  summarize(word = str_c(word,collapse = " "))
+```
+
+```{r}
+# mengubah tiap word yang sudah bersih menjadi kolom
+split_clean1_war <- stri_split_fixed(asc_1_clean_war$word," ",simplify = T)
+split_clean1_war <- as.data.frame(split_clean1_war)
+# simpan teks dengan kolom
+write.csv(split_clean1_war,"split_war1.csv",row.names = F)
+```
+
+```{r}
+# read data teks sebagai data transaction untuk dibuatkan model association rules
+trans_1_war <- read.transactions("split_war1.csv",sep = ",",header = T)
+# modeling association rules menggunakan algoritma apriori
+rules_1_war <- apriori(trans_1_war,parameter = list(supp = 0.1, conf = 0.5))
+# ubah hasil association rules menjadi dataframe
+war_rules_1 <- data.frame(arules::inspect(rules_1_war))
+# simpan hasil association rules
+write.csv(war_rules_1,"rules1_wardah.csv",row.names = F)
+
+```
+
+# Sentiment analysis
+Sentimen analysis melalui scoring sentimen negatif positif. score sentimen berdasarkan kata dari password yang sudah diberikan sentimen secara manual
+```{r}
+sentimen_indo_wardah <- read.csv("password_wardah_sent.csv")
+
+# set word sentimen positif
+sentimen_pos_wardah <- sentimen_indo_wardah %>% filter(sentiment == "positive")
+sentimen_pos_wardah <- sentimen_pos_wardah$term %>% str_trim() %>% str_squish() %>%
+  as.character()
+
+# set word sentimen negatif
+sentimen_neg_wardah <- sentimen_indo_wardah %>% filter(sentiment == "negative")
+sentimen_neg_wardah <- sentimen_neg_wardah$term %>% str_trim() %>% str_squish() %>%
+  as.character()
+```
+
+```{r}
+# buat function untuk scoring sentiment
+score.sentiment_wardah = function(kalimat2, sentimen_pos_wardah, sentimen_neg_wardah, .progress='none')
+{
+  require(plyr)
+  require(stringr)
+  scores = laply(kalimat2, function(kalimat, sentimen_pos_wardah, sentimen_neg_wardah) {
+    # cleaning data teks
+    kalimat = gsub('[[:punct:]]', '', kalimat)
+    kalimat = gsub('[[:cntrl:]]', '', kalimat)
+    kalimat = gsub('\\d+', '', kalimat)
+    kalimat = tolower(kalimat)
+    # list data berdasarkan tab
+    list.kata = str_split(kalimat, '\\s+')
+    # unlist per review
+    kata2 = unlist(list.kata)
+    # scoring positif dan negatif lalu menghapus NA
+    positif.matches = match(kata2, sentimen_pos_wardah)
+    negatif.matches = match(kata2, sentimen_neg_wardah)
+    positif.matches = !is.na(positif.matches)
+    negatif.matches = !is.na(negatif.matches)
+    score = sum(positif.matches) - (sum(negatif.matches))
+    return(score)
+  }, sentimen_pos_wardah, sentimen_neg_wardah, .progress=.progress )
+  scores.df = data.frame(score=scores, text=kalimat2)
+  return(scores.df)
+}
+```
+
+## Sentiment rating 5
+menagplikasikan function score sentiment lalu visualisasi berdasarkan jumlah sentiment yang didapat
+```{r}
+sentimen_5_wardah <- score.sentiment_wardah(wardah_5$review,sentimen_pos_wardah,sentimen_neg_wardah)
+sentimen_5_wardah$sentiment <- ifelse(sentimen_5_wardah$score <=0,"Negatif","Positif") %>% as.factor()
+
+wardah_sent_5 <-  data.frame(table(sentimen_5_wardah$sentiment)) %>%
+  ggplot(aes(x = Var1, y = Freq)) +
+  geom_col(aes(fill = Var1)) + theme_minimal() +
+  geom_label(aes(label = scales::percent(Freq/length(sentimen_5_wardah$text))),size = 4) +
+  geom_text(aes(label = Freq), nudge_y = 30, show.legend = F) +
+  labs(title = "Sentiment Produk Wardah",
+       subtitle = "Rating review 5",
+       x = "Sentiment", y = "Frequency",
+       fill = "") +
+  theme(legend.position = "bottom")
+
+wardah_sent_5
+```
+
+## Sentiment rating 4
+menagplikasikan function score sentiment lalu visualisasi berdasarkan jumlah sentiment yang didapat
+```{r}
+sentimen_4_wardah <- score.sentiment_wardah(wardah_4$review,sentimen_pos_wardah,sentimen_neg_wardah)
+sentimen_4_wardah$sentiment <- ifelse(sentimen_4_wardah$score <=0,"Negatif","Positif") %>% as.factor()
+
+wardah_sent_4 <- data.frame(table(sentimen_4_wardah$sentiment)) %>%
+  ggplot(aes(x = Var1, y = Freq)) +
+  geom_col(aes(fill = Var1)) + theme_minimal() +
+  geom_label(aes(label = scales::percent(Freq/length(sentimen_4_wardah$text))),size = 4) +
+  geom_text(aes(label = Freq), nudge_y = 50, show.legend = F) +
+  labs(title = "Sentiment Produk Wardah",
+       subtitle = "Rating review 4",
+       x = "Sentiment", y = "Frequency",
+       fill = "") +
+  theme(legend.position = "bottom")
+
+wardah_sent_4
+```
+
+## Sentiment rating 3
+menagplikasikan function score sentiment lalu visualisasi berdasarkan jumlah sentiment yang didapat
+```{r}
+sentimen_3_wardah <- score.sentiment_wardah(wardah_3$review,sentimen_pos_wardah,sentimen_neg_wardah)
+sentimen_3_wardah$sentiment <- ifelse(sentimen_3_wardah$score <=0,"Negatif","Positif") %>% as.factor()
+
+wardah_sent_3 <- data.frame(table(sentimen_3_wardah$sentiment)) %>%
+  ggplot(aes(x = Var1, y = Freq)) +
+  geom_col(aes(fill = Var1)) + theme_minimal() +
+  geom_label(aes(label = scales::percent(Freq/length(sentimen_3_wardah$text))),size = 4) +
+  geom_text(aes(label = Freq), nudge_y = 60, show.legend = F) +
+  labs(title = "Sentiment Produk Wardah",
+       subtitle = "Rating review 3",
+       x = "Sentiment", y = "Frequency",
+       fill = "") +
+  theme(legend.position = "bottom")
+
+wardah_sent_3
+```
+
+## Sentiment rating 2
+menagplikasikan function score sentiment lalu visualisasi berdasarkan jumlah sentiment yang didapat
+```{r}
+sentimen_2_wardah <- score.sentiment_wardah(wardah_2$review,sentimen_pos_wardah,sentimen_neg_wardah)
+sentimen_2_wardah$sentiment <- ifelse(sentimen_2_wardah$score <=0,"Negatif","Positif") %>% as.factor()
+
+wardah_sent_2 <- data.frame(table(sentimen_2_wardah$sentiment)) %>%
+  ggplot(aes(x = Var1, y = Freq)) +
+  geom_col(aes(fill = Var1)) + theme_minimal() +
+  geom_label(aes(label = scales::percent(Freq/length(sentimen_2_wardah$text))),size = 4) +
+  geom_text(aes(label = Freq), nudge_y = 35, show.legend = F) +
+  labs(title = "Sentiment Produk Wardah",
+       subtitle = "Rating review 2",
+       x = "Sentiment", y = "Frequency",
+       fill = "") +
+  theme(legend.position = "bottom")
+
+wardah_sent_2
+```
+
+## Sentiment rating 1
+menagplikasikan function score sentiment lalu visualisasi berdasarkan jumlah sentiment yang didapat
+```{r}
+sentimen_1_wardah <- score.sentiment_wardah(wardah_1$review,sentimen_pos_wardah,sentimen_neg_wardah)
+sentimen_1_wardah$sentiment <- ifelse(sentimen_1_wardah$score <=0,"Negatif","Positif") %>% as.factor()
+
+wardah_sent_1 <- data.frame(table(sentimen_1_wardah$sentiment)) %>%
+  ggplot(aes(x = Var1, y = Freq)) +
+  geom_col(aes(fill = Var1)) + theme_minimal() +
+  geom_label(aes(label = scales::percent(Freq/length(sentimen_1_wardah$text))),size = 4) +
+  geom_text(aes(label = Freq), nudge_y = 10, show.legend = F) +
+  labs(title = "Sentiment Produk Wardah",
+       subtitle = "Rating review 1",
+       x = "Sentiment", y = "Frequency",
+       fill = "") +
+  theme(legend.position = "bottom")
+
+wardah_sent_1
+```
+
+# Prediksi rating berdasarkan review
+
+membuat function cleaning teks dengan tambahan password sebagai controler kolom. kata yang ada di password akan menjadi kolom prediktor
+```{r}
+textcleaner_clf_wardah <- function(x){
+  x <- as.character(x)
+  
+  x <- x %>%
+    str_to_lower() %>%  # convert all the string to low alphabet
+    replace_contraction() %>% # replace contraction to their multi-word forms
+    replace_internet_slang() %>% # replace internet slang to normal words
+    replace_emoji() %>% # replace emoji to words
+    replace_emoticon() %>% # replace emoticon to words
+    replace_hash(replacement = "") %>% # remove hashtag
+    replace_word_elongation() %>% # replace informal writing with known semantic replacements
+    replace_number(remove = T) %>% # remove number
+    replace_date(replacement = "") %>% # remove date
+    replace_time(replacement = "") %>% # remove time
+    str_remove_all(pattern = "[[:punct:]]") %>% # remove punctuation
+    str_remove_all(pattern = "[^\\s]*[0-9][^\\s]*") %>% # remove mixed string n number
+    str_squish() %>% # reduces repeated whitespace inside a string.
+    str_trim() # removes whitespace from start and end of string
+  
+  xdtm <- VCorpus(VectorSource(x)) %>%
+    tm_map(removeWords, stopwords("en")) %>%
+    tm_map(removeWords, bahasa.sw) %>%
+    tm_map(removePunctuation) %>%
+    tm_map(content_transformer(stemmword)) %>%
+    tm_map(content_transformer(slangword))
+  
+  # mengubah corpus menjadi document term matrix
+  return(DocumentTermMatrix(xdtm,control = list(
+    dictionary = password_wardah$term
+  )))
+}
+```
+
+## proses cleaning
+```{r}
+# mengaplikasikan function textclean ke review produk
+review_wardah.dtm <- textcleaner_clf_wardah(wardah$review)
+```
+
+```{r}
+# mengubah term matrix menjadi dataframe untuk modeling
+wardah.clean <- as.data.frame(as.matrix(review_wardah.dtm), stringsAsFactors = F)
+# we have 300+ variable in words form. i change the label name from `mood` to labelY to avoid overwriting column names
+new.wardah <- cbind(wardah.clean, data.frame(labelY = wardah$rating))
+# hasil data bersih yang sudah diberi token
+# tiap baris menunjukkan 1 review user
+head(new.wardah)
+```
+
+## Modeling
+Untuk menjawab pertanyaan penelitian 3, dilakukan modeling dengan algoritma Naive Bayes dan Random Forest (more model soon). Akurasi model didapat dari prediksi test data (unseen data). **Note:** metode yang dilakukan ada klasifikasi, jadi rating dianggap tidak mempunyai level. rating 1 akan dianggap sama dengan rating 5 and vice versa
+
+### splitting
+split data menjadi data train dan test dengan proporsi 75% dan 25%. data train digunakan untuk membangun model dan test untuk evaluasi model (prediksi)
+```{r}
+set.seed(1502) # making sample reproduciable
+splitter_war <- initial_split(new.wardah, prop = 0.75, strata = "labelY")
+train_war <- training(splitter_war)
+test_war <- testing(splitter_war)
+```
+
+### Naive Bayes
+Naive bayes membutuhkan format data yang berbeda. Naive bayes tidak membutuhkan frekuensi token. token hanya berisi 1 dan 0, 1 menunjukkan kata tersebut ada didalam kalimat dan 0 brarti tidak ada kehadiran kata tersebut
+```{r}
+# split the data. 75% for train data, and 25% for test data
+set.seed(1502)
+index_w <- sample(1:nrow(review_wardah.dtm), 0.75*nrow(review_wardah.dtm))
+
+train_x_war <- review_wardah.dtm[index_w,]
+test_x_war <- review_wardah.dtm[-index_w,]
+# subset label/target variable
+train_label_war <- wardah[index_w,"rating"]
+test_label_war <- wardah[-index_w,"rating"]
+```
+
+Use bernoulli converter to convert any value above 0 to 1 and 0 to remain 0.
+```{r}
+# bernoulli conv 
+bernoulli_conv <- function(x){
+  x <- as.factor(as.numeric(x>0))
+}
+```
+
+apply bernoulli converter to train and test data
+```{r}
+train_x_war <- apply(train_x_war,2,bernoulli_conv)
+test_x_war <- apply(test_x_war,2,bernoulli_conv)
+```
+
+Membangun model naive bayes
+```{r}
+# train the model
+mod.nb_war <- naiveBayes(train_x_war, as.factor(train_label_war), laplace = 1)
+
+# predict to test data
+pred.nb_war <- predict(mod.nb_war, test_x_war,
+                   type = "class")
+
+pred.nb_war.x <- cbind(data.frame(pred.nb_war),as.factor(test_label_war))%>%
+  setNames(c("pred","actual"))
+
+pred.nb_war.x
+```
+
+Membuat confusion matrix untuk evaluasi hasil prediksi model
+```{r}
+cf.nb_war <- confusionMatrix(data = pred.nb_war.x$pred,
+                         reference = pred.nb_war.x$actual)
+cf.nb_war
+```
+
+### Random Forest
+model random forest dengan mesin `ranger` tidak dapat menerima nama kolom dengan special character seperti for, break, next, return, dll. Perlu dilakukan koversi nama kolom menjadi nama yang bukan special character
+```{r}
+# this chunks are made for random forest model and future model tuning
+## the column names like break,for,next,if are considered as special character thus raises an error when building random forest and model tuning.
+## i store the train and test data to new variabel so the old one remain reproducible
+train_tune_war <- train_war
+test_tune_war <- test_war
+
+colnames(train_tune_war) <- make.names(colnames(train_tune_war))
+colnames(test_tune_war) <- make.names(colnames(test_tune_war))
+
+# build 5 folds cross validation for tuning evaluation
+set.seed(1502)
+folds <- vfold_cv(train_tune_war, 5)
+```
+
+Membangun model Random Forest
+```{r}
+mod.rf_war <- rand_forest(trees = 550, mtry = 6, mode = "classification") %>%
+  set_engine("ranger") %>% fit(labelY~., data = train_tune_war)
+
+pred.rf_war <- predict(mod.rf_war, test_tune_war, 
+                   type = "class")
+
+pred.rf.x_war <- as.data.frame(cbind(pred.rf_war, test_tune_war$labelY)) %>%
+  setNames(c("pred","actual"))
+
+pred.rf.x_war
+```
+
+Membuat confusion matrix untuk evaluasi hasil prediksi model
+```{r}
+cf.rf_war <- confusionMatrix(data = pred.rf.x_war$pred,
+                         reference = pred.rf.x_war$actual)
+cf.rf_war
+```
+
+# Kesimpulan Wardah
+
